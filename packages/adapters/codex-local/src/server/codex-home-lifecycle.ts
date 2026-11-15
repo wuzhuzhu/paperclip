@@ -17,7 +17,8 @@ import path from "node:path";
  * plugin marketplace clone and its sync lock) is dropped after an hour idle
  * because Codex re-syncs it on demand. Both are env-tunable.
  *
- * Concurrency protocol (RAI-2819). A run's lease and a reaper's delete must never
+ * Concurrency protocol (RAI-2819), for a local filesystem on one host with a
+ * shared PID namespace. A run's lease and a reaper's delete must never
  * interleave so that a live run loses its home. Both sides use a Dekker-style
  * handshake around a per-home reap lock that lives OUTSIDE the home
  * (`<home>.reap-lock`, so deleting the home cannot delete the lock):
@@ -37,6 +38,12 @@ import path from "node:path";
  * already passed stillHeld and may resume its rename. Only a valid PID proven
  * dead permits recovery. Damaged locks and reused live PIDs fail closed; without
  * process-start identity, PID reuse cannot safely be distinguished from liveness.
+ * Dead-lock recovery is serialized by an atomic mkdir of `<lock>.recovery`.
+ * The winner re-reads the owner under that guard before unlinking; losers do
+ * not unlink anything. The guard is never automatically reclaimed: a crash
+ * during recovery leaves a fail-closed fence rather than another stale-unlink
+ * race. Live owners release only their own lock, so no cooperating caller can
+ * replace a proven-dead lock between the guarded read and unlink.
  */
 export const GENERATED_HOME_KINDS = ["skill-runtimes", "connector-runtimes"] as const;
 export type GeneratedHomeKind = (typeof GENERATED_HOME_KINDS)[number];
@@ -145,7 +152,15 @@ export function reapLockPath(home: string): string {
   return `${home}${REAP_LOCK_SUFFIX}`;
 }
 
-/** "free" | "held" (a live reaper is inside its critical section). Abandoned locks are cleared. */
+async function reapOwnerIsDead(file: string, options: CodexHomeLifecycleOptions): Promise<boolean> {
+  try {
+    const record = JSON.parse(await fs.readFile(file, "utf8")) as Partial<ReapLockRecord> | null;
+    const pid = record?.pid;
+    return typeof pid === "number" && Number.isInteger(pid) && pid > 0 && !options.isPidAlive(pid);
+  } catch { return false; } // being written, corrupt, or unreadable: fail closed
+}
+
+/** "free" | "held". Only a provably dead owner can be recovered, under an exclusive guard. */
 async function reapLockState(home: string, options: CodexHomeLifecycleOptions): Promise<"free" | "held"> {
   const file = reapLockPath(home);
   try {
@@ -153,16 +168,29 @@ async function reapLockState(home: string, options: CodexHomeLifecycleOptions): 
   } catch (error) {
     return errCode(error) === "ENOENT" ? "free" : "held"; // cannot tell: fail closed
   }
-  let record: Partial<ReapLockRecord> | null = null;
+  if (!(await reapOwnerIsDead(file, options))) return "held";
+  const guard = `${file}.recovery`;
   try {
-    record = JSON.parse(await fs.readFile(file, "utf8")) as Partial<ReapLockRecord>;
-  } catch { /* being written, or corrupt */ }
-  const pid = record?.pid;
-  // Age is not fencing: a live owner may be suspended inside fs.rename, after
-  // its last ownership check. Invalid/unknown owners must also fail closed.
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || options.isPidAlive(pid)) return "held";
-  await fs.rm(file, { force: true }).catch(() => undefined);
-  return (await exists(file)) ? "held" : "free";
+    await fs.mkdir(guard);
+  } catch { return "held"; } // contention, an abandoned guard, or I/O failure
+  try {
+    // The first observation may be stale: another recovery could have completed
+    // before we acquired the guard. Revalidate while all other recoverers are
+    // excluded, and keep the guard until the unlink has actually completed.
+    if (!(await reapOwnerIsDead(file, options))) return "held";
+    await fs.rm(file, { force: true });
+    try {
+      await fs.lstat(file);
+      return "held";
+    } catch (error) {
+      return errCode(error) === "ENOENT" ? "free" : "held";
+    }
+  } catch { return "held"; }
+  finally {
+    // Never recover this guard or remove it recursively. Only its single owner
+    // removes it, once; interrupted recovery deliberately sacrifices availability.
+    await fs.rmdir(guard).catch(() => undefined);
+  }
 }
 
 async function waitForNoReapLock(home: string, options: CodexHomeLifecycleOptions): Promise<boolean> {

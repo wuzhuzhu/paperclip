@@ -534,6 +534,148 @@ describe("generated Codex home lifecycle", () => {
     }
   });
 
+  it.each(["home", ".tmp"] as const)("preserves successful leases during concurrent dead-lock recovery of %s", async (victim) => {
+    const home = await makeHome(1, 30 * DAY);
+    const lock = `${home}.reap-lock`;
+    const child = spawn(process.execPath, ["-e", "0"]);
+    const deadPid = await new Promise<number>((resolve) => child.once("exit", () => resolve(child.pid!)));
+    await fs.writeFile(lock, JSON.stringify({ pid: deadPid, startedAt: clock, token: "dead" }));
+    const unlinkEntered = deferred();
+    const resumeUnlink = deferred();
+    const renameEntered = deferred();
+    const resumeRename = deferred();
+    const rm = fs.rm.bind(fs);
+    const rename = fs.rename.bind(fs);
+    let first = true;
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (file, options) => {
+      if (file === lock && first) {
+        first = false;
+        unlinkEntered.resolve();
+        await resumeUnlink.promise;
+      }
+      return rm(file, options);
+    });
+    const target = victim === "home" ? home : path.join(home, ".tmp");
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (from === target && String(to).includes(".reaping-")) {
+        renameEntered.resolve(); // the owner has already passed stillHeld
+        await resumeRename.promise;
+      }
+      return rename(from, to);
+    });
+    const acquire = acquireCodexHomeLease(home, "delayed-recovery", lifecycle({ leaseWaitMs: 2, sleep: async () => undefined }));
+    let reaper: Promise<unknown> | undefined;
+    let lease: Awaited<typeof acquire> = null;
+    try {
+      await unlinkEntered.promise;
+      reaper = victim === "home" ? prune(99) : removeIdleCodexHomeTemp(home, opts());
+      // Old source reaches rename under a new live token; fixed source refuses
+      // recovery while the first caller holds the guard. Neither path uses timers.
+      const outcome = await Promise.race([
+        renameEntered.promise.then(() => "renaming"),
+        reaper.then(() => "refused"),
+      ]);
+      if (outcome === "renaming") {
+        const record = JSON.parse(await fs.readFile(lock, "utf8"));
+        expect(record.pid).toBe(process.pid);
+        expect(record.token).not.toBe("dead");
+      }
+      resumeUnlink.resolve();
+      lease = await acquire;
+      // A safe null is allowed: QA's assert.ok(lease) is only a reproduction oracle.
+      if (lease) {
+        expect(await inspectCodexHomeLeases(home, opts())).toBe("busy");
+        await fs.writeFile(path.join(home, ".tmp/plugins/active-marker"), "active plugin");
+        await fs.writeFile(path.join(home, "sessions/active-marker"), "active session");
+      }
+      resumeRename.resolve();
+      await reaper;
+      if (lease) {
+        expect(await exists(path.join(home, ".tmp/plugins/active-marker")), "successful lease lost its plugin").toBe(true);
+        expect(await exists(path.join(home, "sessions/active-marker")), "successful lease lost its session").toBe(true);
+        expect(await inspectCodexHomeLeases(home, opts())).toBe("busy");
+        expect(await removeIdleCodexHomeTemp(home, opts())).toBe(false);
+        expect((await prune(99)).homesRemoved).toEqual([]);
+      }
+      if (outcome === "refused") {
+        // Even when acquire safely returns null, the refused reaper must retain
+        // the existing resources; do not let a null lease make this vacuous.
+        expect(await exists(path.join(home, ".tmp/plugins/marketplace.json"))).toBe(true);
+        expect(await exists(path.join(home, "sessions/2026/11/10/rollout.jsonl"))).toBe(true);
+      }
+      expect(outcome, "concurrent dead-lock recovery must exclude a second unlink").toBe("refused");
+    } finally {
+      resumeUnlink.resolve();
+      resumeRename.resolve();
+      await Promise.allSettled([acquire, reaper]);
+      await lease?.release();
+      rmSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
+  it.each(["home", ".tmp"] as const)("revalidates a stale dead-owner observation while a new %s reaper is suspended after stillHeld", async (victim) => {
+    const home = await makeHome(1, 30 * DAY);
+    const lock = `${home}.reap-lock`;
+    const child = spawn(process.execPath, ["-e", "0"]);
+    const deadPid = await new Promise<number>((resolve) => child.once("exit", () => resolve(child.pid!)));
+    await fs.writeFile(lock, JSON.stringify({ pid: deadPid, startedAt: clock, token: "dead" }));
+    const readEntered = deferred();
+    const resumeRead = deferred();
+    const renameEntered = deferred();
+    const resumeRename = deferred();
+    const readFile = fs.readFile.bind(fs);
+    const rename = fs.rename.bind(fs);
+    let first = true;
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (file, ...args) => {
+      const contents = await readFile(file, ...args);
+      if (file === lock && first) {
+        first = false;
+        readEntered.resolve();
+        await resumeRead.promise;
+      }
+      return contents;
+    });
+    const target = victim === "home" ? home : path.join(home, ".tmp");
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (from === target && String(to).includes(".reaping-")) {
+        renameEntered.resolve();
+        await resumeRename.promise;
+      }
+      return rename(from, to);
+    });
+    const acquire = acquireCodexHomeLease(home, "stale-reader", lifecycle({ leaseWaitMs: 2, sleep: async () => undefined }));
+    let reaper: Promise<unknown> | undefined;
+    let lease: Awaited<typeof acquire> = null;
+    try {
+      await readEntered.promise;
+      reaper = victim === "home" ? prune(99) : removeIdleCodexHomeTemp(home, opts());
+      await renameEntered.promise;
+      const liveRecord = await readFile(lock, "utf8");
+      expect(JSON.parse(liveRecord).pid).toBe(process.pid);
+      resumeRead.resolve();
+      lease = await acquire;
+      if (lease) {
+        await fs.writeFile(path.join(home, ".tmp/plugins/active-marker"), "active plugin");
+        await fs.writeFile(path.join(home, "sessions/active-marker"), "active session");
+      }
+      resumeRename.resolve();
+      await reaper;
+      if (lease) {
+        expect(await exists(path.join(home, ".tmp/plugins/active-marker")), "successful lease lost its plugin").toBe(true);
+        expect(await exists(path.join(home, "sessions/active-marker")), "successful lease lost its session").toBe(true);
+      }
+      expect(lease, "stale observation must not remove the new live lock").toBeNull();
+    } finally {
+      resumeRead.resolve();
+      resumeRename.resolve();
+      await Promise.allSettled([acquire, reaper]);
+      await lease?.release();
+      readSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
   it.each([
     "{", "null", "{}",
     JSON.stringify({ pid: 0, startedAt: 0, token: "t" }),
@@ -556,6 +698,71 @@ describe("generated Codex home lifecycle", () => {
     expect(await removeIdleCodexHomeTemp(home, opts())).toBe(false);
     expect(await exists(path.join(home, ".tmp/plugins/marketplace.json"))).toBe(true);
     expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it.each(["abandoned guard", "guard I/O", "unlink I/O", "guarded read I/O"] as const)("fails closed on dead-lock recovery with %s", async (failure) => {
+    const home = await makeHome(1, 30 * DAY);
+    const lock = `${home}.reap-lock`;
+    const guard = `${lock}.recovery`;
+    const record = JSON.stringify({ pid: 123456, startedAt: clock, token: "dead" });
+    await fs.writeFile(lock, record);
+    if (failure === "abandoned guard") await fs.mkdir(guard);
+    const mkdir = fs.mkdir.bind(fs);
+    const rm = fs.rm.bind(fs);
+    const readFile = fs.readFile.bind(fs);
+    const denied = Object.assign(new Error("injected recovery I/O failure"), { code: "EACCES" });
+    const mkdirSpy = vi.spyOn(fs, "mkdir").mockImplementation(async (file, ...args) => {
+      if (file === guard && failure === "guard I/O") throw denied;
+      return mkdir(file, ...args);
+    });
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (file, options) => {
+      if (file === lock && failure === "unlink I/O") throw denied;
+      return rm(file, options);
+    });
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (file, ...args) => {
+      if (file === lock && failure === "guarded read I/O" && await exists(guard)) throw denied;
+      return readFile(file, ...args);
+    });
+    const options = lifecycle({ leaseWaitMs: 2, sleep: async () => undefined, isPidAlive: () => false });
+    try {
+      expect(await acquireCodexHomeLease(home, "run", options)).toBeNull();
+      expect(await removeIdleCodexHomeTemp(home, options)).toBe(false);
+      expect((await prune(99, options)).homesRemoved).toEqual([]);
+      expect(await readFile(lock, "utf8")).toBe(record);
+      expect(await exists(path.join(home, ".tmp/plugins/marketplace.json"))).toBe(true);
+      expect(await exists(path.join(home, "sessions/2026/11/10/rollout.jsonl"))).toBe(true);
+      expect(await exists(guard)).toBe(failure === "abandoned guard");
+    } finally {
+      mkdirSpy.mockRestore();
+      rmSpy.mockRestore();
+      readSpy.mockRestore();
+    }
+  });
+
+  it("refuses acquisition when the lock cannot be inspected after a guarded unlink", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const lock = `${home}.reap-lock`;
+    await fs.writeFile(lock, JSON.stringify({ pid: 123456, startedAt: clock, token: "dead" }));
+    const lstat = fs.lstat.bind(fs);
+    const rm = fs.rm.bind(fs);
+    let removed = false;
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (file, options) => {
+      await rm(file, options);
+      if (file === lock) removed = true;
+    });
+    const statSpy = vi.spyOn(fs, "lstat").mockImplementation(async (file, ...args) => {
+      if (file === lock && removed) throw Object.assign(new Error("injected lock stat failure"), { code: "EACCES" });
+      return lstat(file, ...args);
+    });
+    try {
+      expect(await acquireCodexHomeLease(home, "run", lifecycle({
+        leaseWaitMs: 2, sleep: async () => undefined, isPidAlive: () => false,
+      }))).toBeNull();
+      expect(removed).toBe(true);
+      expect(await exists(`${lock}.recovery`)).toBe(false);
+      expect(await exists(path.join(home, ".tmp/plugins/marketplace.json"))).toBe(true);
+      expect(await exists(path.join(home, "sessions/2026/11/10/rollout.jsonl"))).toBe(true);
+    } finally { rmSpy.mockRestore(); statSpy.mockRestore(); }
   });
 
   it("recovers a real dead reaper's lock for both destructive entry points", async () => {
