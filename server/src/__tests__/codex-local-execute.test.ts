@@ -1762,6 +1762,110 @@ process.exit(1);
     }
   });
 
+  // RAI-2802: a managed AI connection points CODEX_HOME at a fresh server-created
+  // credential home (`<tmpdir>/paperclip-ai-*/provider`) on every run. That path is
+  // not an identity; hashing it into the runtime digest made every run a new home.
+  it("reuses one generated home across runs whose managed credential home path and tokens change", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reuse-codex-"));
+    const workspace = path.join(root, "workspace");
+    const command = path.join(root, "codex");
+    const capture = path.join(root, "capture.json");
+    const skillSource = path.join(root, "skill-v1");
+    const tempHomes: string[] = [];
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(skillSource, { recursive: true });
+    await fs.writeFile(path.join(skillSource, "SKILL.md"), "# AgentMail\nAssigned inbox one.");
+    await writeFakeCodexCommand(command);
+    const keys = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "CODEX_HOME"] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip");
+    process.env.PAPERCLIP_INSTANCE_ID = "reuse";
+    delete process.env.CODEX_HOME;
+    // Mirrors ai-connection-runtime: mkdtemp(<tmpdir>/paperclip-ai-<company>-<grant>-) + /provider.
+    const serverCredentialHome = async (accountId: string, token: string, parent?: string) => {
+      const home = await fs.mkdtemp(path.join(parent ?? await fs.realpath(os.tmpdir()), "paperclip-ai-company-1-grant-1-"));
+      tempHomes.push(home);
+      const provider = path.join(home, "provider");
+      await fs.mkdir(provider, { mode: 0o700 });
+      await fs.writeFile(path.join(provider, "config.toml"), 'cli_auth_credentials_store = "file"\n');
+      await fs.writeFile(path.join(provider, "auth.json"), JSON.stringify({ tokens: { account_id: accountId, access_token: token } }));
+      return provider;
+    };
+    const invoke = async (provider: string, sessionIdentity: string | null, opts: { agentId?: string; digestSkills?: boolean } = {}) => {
+      const config = {
+        engine: "cli", command, cwd: workspace,
+        env: { CODEX_HOME: provider, PAPERCLIP_TEST_CAPTURE_PATH: capture },
+        ...(sessionIdentity ? { managedAiConnection: { sessionIdentity } } : {}),
+        paperclipSkillSync: { desiredSkills: opts.digestSkills === false ? [] : ["paperclipai/paperclip/agentmail"] },
+        paperclipRuntimeSkills: [{ key: "paperclipai/paperclip/agentmail", runtimeName: "agentmail", source: skillSource }],
+      };
+      const agentId = opts.agentId ?? "agent-1";
+      const result = await execute({ runId: `run-${agentId}-${Math.random()}`,
+        agent: { id: agentId, companyId: "company-1", name: "QA", adapterType: "codex_local", adapterConfig: config },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config, context: {}, authToken: "test-token", onLog: async () => {},
+      });
+      expect(result.errorMessage).toBeNull();
+      expect(result.exitCode).toBe(0);
+      return JSON.parse(await fs.readFile(capture, "utf8")) as CapturePayload;
+    };
+    const homesFor = async (agentId: string) =>
+      (await fs.readdir(path.join(root, "paperclip/instances/reuse/companies/company-1/codex-home/skill-runtimes", agentId)).catch(() => [])).length;
+    try {
+      const first = await invoke(await serverCredentialHome("acct-a", "token-1"), "grant-1:user-1:secret-1:1");
+      expect(first.codexHome).toContain("skill-runtimes/agent-1/");
+      // Five consecutive runs, each with a brand-new credential home path and a refreshed token.
+      for (let run = 2; run <= 5; run += 1) {
+        const next = await invoke(await serverCredentialHome("acct-a", `token-${run}`), "grant-1:user-1:secret-1:1");
+        expect(next.codexHome).toBe(first.codexHome);
+      }
+      expect(await homesFor("agent-1")).toBe(1);
+      // Run end: the lease is released and Codex's plugin marketplace clone is dropped,
+      // while session state stays. (Codex itself re-creates `.tmp/plugins` on demand.)
+      await fs.mkdir(path.join(first.codexHome!, ".tmp/plugins"), { recursive: true });
+      await fs.mkdir(path.join(first.codexHome!, "sessions/2026/11"), { recursive: true });
+      await fs.writeFile(path.join(first.codexHome!, "sessions/2026/11/rollout.jsonl"), "{}\n");
+      const afterCache = await invoke(await serverCredentialHome("acct-a", "token-5b"), "grant-1:user-1:secret-1:1");
+      expect(afterCache.codexHome).toBe(first.codexHome);
+      await expect(fs.stat(path.join(first.codexHome!, ".tmp"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readdir(path.join(first.codexHome!, ".paperclip-leases"))).toEqual([]);
+      expect(await fs.readFile(path.join(first.codexHome!, "sessions/2026/11/rollout.jsonl"), "utf8")).toBe("{}\n");
+      // The reused home follows the newest credential, not the first run's deleted source.
+      expect(JSON.parse(await fs.readFile(path.join(first.codexHome!, "auth.json"), "utf8")).tokens.access_token).toBe("token-5b");
+
+      // A different connection session (another account/user/epoch) is isolated.
+      const otherSession = await invoke(await serverCredentialHome("acct-b", "token-b"), "grant-1:user-1:secret-2:1");
+      expect(otherSession.codexHome).not.toBe(first.codexHome);
+      const reconnected = await invoke(await serverCredentialHome("acct-a", "token-6"), "grant-1:user-1:secret-1:2");
+      expect(reconnected.codexHome).not.toBe(first.codexHome);
+      // Same session identity but the stored account changed underneath: never share.
+      const swapped = await invoke(await serverCredentialHome("acct-c", "token-c"), "grant-1:user-1:secret-1:1");
+      expect(swapped.codexHome).not.toBe(first.codexHome);
+      // Removing a skill authorization selects a different home.
+      const revoked = await invoke(await serverCredentialHome("acct-a", "token-7"), "grant-1:user-1:secret-1:1", { digestSkills: false });
+      expect(revoked.codexHome).not.toBe(first.codexHome);
+      // Another agent never shares.
+      const otherAgent = await invoke(await serverCredentialHome("acct-a", "token-8"), "grant-1:user-1:secret-1:1", { agentId: "agent-2" });
+      expect(otherAgent.codexHome).not.toBe(first.codexHome);
+
+      // Safe degradation: no session identity, or a credential home that is not the
+      // server-created `paperclip-ai-*/provider` directory, keeps the path in the digest.
+      const noIdentityA = await invoke(await serverCredentialHome("acct-a", "token-9"), null);
+      const noIdentityB = await invoke(await serverCredentialHome("acct-a", "token-10"), null);
+      expect(noIdentityA.codexHome).not.toBe(noIdentityB.codexHome);
+      const foreign = path.join(root, "foreign");
+      await fs.mkdir(foreign);
+      const foreignA = await invoke(await serverCredentialHome("acct-a", "token-11", foreign), "grant-1:user-1:secret-1:1");
+      const foreignB = await invoke(await serverCredentialHome("acct-a", "token-12", foreign), "grant-1:user-1:secret-1:1");
+      expect(foreignA.codexHome).not.toBe(foreignB.codexHome);
+      expect(foreignA.codexHome).not.toBe(first.codexHome);
+    } finally {
+      for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }
+      await Promise.all(tempHomes.map((home) => fs.rm(home, { recursive: true, force: true })));
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("respects an explicit CODEX_HOME config override even in worktree mode", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-explicit-"));
     const workspace = path.join(root, "workspace");

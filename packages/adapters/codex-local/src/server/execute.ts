@@ -96,6 +96,15 @@ import {
   resolveCodexAuthPrecedence,
 } from "./auth-precedence.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
+import { resolveManagedAiSessionIdentity } from "./managed-credential-home.js";
+import {
+  acquireCodexHomeLease,
+  pruneSupersededCodexHomes,
+  removeIdleCodexHomeTemp,
+  shouldDropPluginCloneAfterRun,
+  touchCodexHomeLastUsed,
+  type GeneratedHomeKind,
+} from "./codex-home-lifecycle.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -667,6 +676,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         .map(entry => [entry.key, entry.source]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     })).digest("hex")
     : connectorSkillDigest;
+  let generatedHome: { companyHomeRoot: string; agentId: string; kind: GeneratedHomeKind; digest: string } | null = null;
   const runtimeCredentialHome = runtimeSkillDigest
     ? skillSourceHome ?? await prepareManagedCodexHome(process.env, onLog, agent.companyId, { apiKey: configuredOpenAiApiKey })
     : null;
@@ -679,15 +689,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Copy-back may retain a refreshed regular credential in a generated home.
     // Account switches must select a different home, while token refreshes for
     // the same subscription identity preserve its cache and session state.
+    // A managed AI connection hands every run a fresh temp credential home, so its
+    // path is a nonce and its bytes change on each token refresh. Its session
+    // identity (grant, user, secret, reconnect epoch) is the stable key instead;
+    // the account id still guards against the stored account changing underneath.
+    // Without a verifiable session identity the path/bytes stay in the digest,
+    // which can only over-isolate, never share a home across credentials.
+    const managedSessionIdentity = await resolveManagedAiSessionIdentity(config, credentialHome);
     const credentialIdentity = credentialBytes
-      ? readSubscriptionAccountId(credentialBytes) ?? createHash("sha256").update(credentialBytes).digest("hex") : null;
+      ? readSubscriptionAccountId(credentialBytes)
+        ?? (managedSessionIdentity ? null : createHash("sha256").update(credentialBytes).digest("hex"))
+      : null;
     runtimeSkillDigest = createHash("sha256").update(JSON.stringify({
-      runtimeSkillDigest, credentialHome, credentialIdentity, selectedConfigDigest, apiKey: envConfig.OPENAI_API_KEY ?? null,
+      runtimeSkillDigest, credentialHome: managedSessionIdentity ? "<managed-ai-home>" : credentialHome,
+      credentialIdentity, selectedConfigDigest, apiKey: envConfig.OPENAI_API_KEY ?? null,
+      ...(managedSessionIdentity ? { managedSessionIdentity } : {}),
     })).digest("hex");
     // Different authorized versions/assignments get separate homes, including
     // session state. Previously permitted private links cannot survive revocation.
-    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
-      connectorSkillDigest ? "connector-runtimes" : "skill-runtimes", agent.id, runtimeSkillDigest);
+    generatedHome = {
+      companyHomeRoot: resolveManagedCodexHomeDir(process.env, agent.companyId),
+      agentId: agent.id,
+      kind: connectorSkillDigest ? "connector-runtimes" : "skill-runtimes",
+      digest: runtimeSkillDigest,
+    };
+    configuredCodexHome = path.join(generatedHome.companyHomeRoot, generatedHome.kind, agent.id, runtimeSkillDigest);
   }
   if (!executionTargetIsRemote) {
     await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
@@ -742,6 +768,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
+  // Mark the generated home as used before anything slow runs, so a concurrent
+  // recycling pass never sees a reused old home as idle.
+  if (generatedHome) await touchCodexHomeLastUsed(effectiveCodexHome);
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
   // and with OPENAI_API_KEY="" the provider rejects every request with
@@ -781,6 +810,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
+  // A live lease is the only "in use" signal recycling honours (never directory mtimes).
+  // Without one the run still proceeds, but nothing destructive is done to its home.
+  const homeLease = generatedHome ? await acquireCodexHomeLease(effectiveCodexHome, runId) : null;
   let observabilityProfile: Awaited<ReturnType<typeof prepareCodexObservabilityProfile>> | null = null;
   let observabilityPreparationFailed = false;
   try {
@@ -1702,6 +1734,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
+    // Release the lease on every exit path, then recycle. Nothing here may fail the run.
+    if (generatedHome) {
+      try {
+        const idle = homeLease ? await homeLease.release() : false;
+        // The plugin marketplace clone is a per-home cache Codex re-syncs on demand.
+        // Drop it when the last run leaves; the lease check makes this safe under concurrency.
+        if (idle && shouldDropPluginCloneAfterRun()) await removeIdleCodexHomeTemp(effectiveCodexHome);
+        const report = await pruneSupersededCodexHomes({
+          companyHomeRoot: generatedHome.companyHomeRoot,
+          agentId: generatedHome.agentId,
+          current: { kind: generatedHome.kind, digest: generatedHome.digest },
+        });
+        if (report.tempRemoved.length > 0 || report.homesRemoved.length > 0 || report.failures.length > 0) {
+          await onLog(
+            report.failures.length > 0 ? "stderr" : "stdout",
+            `[paperclip] Codex home recycling: cleared plugin cache in ${report.tempRemoved.length} idle home(s), removed ${report.homesRemoved.length} expired home(s), ${report.failures.length} failure(s)${report.truncated ? ", more remain for the next run" : ""}.\n`,
+          );
+        }
+      } catch (error) {
+        await Promise.resolve(onLog("stderr", `[paperclip] Codex home recycling skipped: ${error instanceof Error ? error.message : String(error)}\n`)).catch(() => undefined);
+      }
+    }
     // Remove the staged CODEX_HOME allowlist temp dir on every exit path
     // (teardown AND error), never only the happy path. Cleanup failure is
     // logged, not fatal — a leaked temp dir must not crash the run.
