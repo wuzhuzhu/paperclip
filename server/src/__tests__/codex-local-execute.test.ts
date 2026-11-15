@@ -1939,8 +1939,11 @@ process.exit(1);
     await fs.mkdir(skillSource, { recursive: true });
     await fs.writeFile(path.join(skillSource, "SKILL.md"), "# AgentMail\nAssigned inbox one.");
     await writeFakeCodexCommand(command);
-    const keys = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "CODEX_HOME", "OPENAI_API_KEY"] as const;
+    const keys = ["HOME", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "CODEX_HOME", "OPENAI_API_KEY"] as const;
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    // Readiness also accepts credentials from the shared ~/.codex home. Keep
+    // that fallback empty so setup really throws on hosts signed in to Codex.
+    process.env.HOME = root;
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip");
     process.env.PAPERCLIP_INSTANCE_ID = "lease-setup-fail";
     delete process.env.CODEX_HOME;
