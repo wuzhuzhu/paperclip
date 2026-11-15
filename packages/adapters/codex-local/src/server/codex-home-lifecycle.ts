@@ -16,30 +16,74 @@ import path from "node:path";
  * release/ops cycle) while still bounding disk. Disposable `.tmp` (the Codex
  * plugin marketplace clone and its sync lock) is dropped after an hour idle
  * because Codex re-syncs it on demand. Both are env-tunable.
+ *
+ * Concurrency protocol (RAI-2819). A run's lease and a reaper's delete must never
+ * interleave so that a live run loses its home. Both sides use a Dekker-style
+ * handshake around a per-home reap lock that lives OUTSIDE the home
+ * (`<home>.reap-lock`, so deleting the home cannot delete the lock):
+ *
+ *   reaper:   take lock -> inspect leases (must be idle) -> re-check idleness
+ *             -> atomically rename the victim away -> drop lock -> delete garbage
+ *   acquirer: wait for no lock -> write lease -> re-check lock; if a reaper holds
+ *             it, withdraw the lease and retry; finally verify the lease file is
+ *             still where it was written
+ *
+ * Either the reaper's inspect sees the lease (it backs off), or the acquirer's
+ * re-check sees the lock (it backs off). Deletion is a rename, so a run that
+ * wins the lease never sees a half-deleted home: it starts on the original home
+ * or, if a reaper took it first, on a freshly created one. A lease whose process
+ * is alive is never reclaimed, however old: there is no age backstop for it.
  */
 export const GENERATED_HOME_KINDS = ["skill-runtimes", "connector-runtimes"] as const;
 export type GeneratedHomeKind = (typeof GENERATED_HOME_KINDS)[number];
 
 export const LEASE_DIR_NAME = ".paperclip-leases";
 export const LAST_USED_FILE = ".paperclip-last-used";
+const REAP_LOCK_SUFFIX = ".reap-lock";
+const TEMP_DIR = ".tmp";
+const MAX_LEASE_ATTEMPTS = 50;
+const TEMP_REAPING = /^\.tmp\.reaping-[a-f0-9]{8}$/;
 const DIGEST_DIR = /^[a-f0-9]{64}$/;
 const REAPING_DIR = /^[a-f0-9]{64}\.reaping-[a-f0-9]{8}$/;
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+export type CodexHomeLifecycleStage =
+  /** Acquirer: lock was clear; the lease is about to be written. */
+  | "before-lease-write"
+  /** Acquirer: lease is on disk; the reap lock is about to be re-checked. */
+  | "after-lease-write"
+  /** Run end: the lease file is gone; nothing else protects the home any more. */
+  | "lease-dropped"
+  /** Reaper: about to take the lock (after the unlocked idleness check). */
+  | "reap-requested"
+  /** Reaper: lock held and home judged idle; the rename is about to happen. */
+  | "reap-selected"
+  /** Reaper: victim renamed away and lock dropped; garbage is about to be deleted. */
+  | "reap-renamed";
+
 export interface CodexHomeLifecycleOptions {
   retentionMs: number;
   tempGraceMs: number;
-  /** Backstop for a lease whose process is still alive but which was never released. */
-  maxLeaseMs: number;
+  /**
+   * A lease file that cannot be parsed has no pid to probe. It is trusted only for
+   * this long. A parsed lease whose process is alive is NEVER reclaimed by age.
+   */
+  unreadableLeaseGraceMs: number;
+  /** A reap lock older than this (or whose owner died) is considered abandoned. */
+  reapLockStaleMs: number;
+  /** How long a run waits for a reaper to finish its (millisecond-scale) critical section. */
+  leaseWaitMs: number;
+  leasePollMs: number;
   /** Total removals (temp dirs + whole homes) per pass; keeps a run's tail latency bounded. */
   maxOperationsPerPass: number;
   /** Entries inspected per home when looking for recent activity; past it the home counts as active. */
   maxScanEntries: number;
   now: () => number;
   isPidAlive: (pid: number) => boolean;
-  /** Test seam: runs after a home was renamed away and before it is deleted. */
-  afterRename?: (renamed: string) => Promise<void>;
+  sleep: (ms: number) => Promise<void>;
+  /** Test seam: deterministic interleaving points of the lease/reap protocol. */
+  onStage?: (stage: CodexHomeLifecycleStage, target: string) => Promise<void>;
 }
 
 function positiveNumber(value: string | undefined): number | null {
@@ -65,11 +109,15 @@ export function resolveCodexHomeLifecycleOptions(
   return {
     retentionMs: (positiveNumber(env.PAPERCLIP_CODEX_HOME_RETENTION_DAYS) ?? 7) * DAY_MS,
     tempGraceMs: (positiveNumber(env.PAPERCLIP_CODEX_HOME_TEMP_GRACE_MINUTES) ?? 60) * 60 * 1000,
-    maxLeaseMs: 2 * DAY_MS,
+    unreadableLeaseGraceMs: 2 * DAY_MS,
+    reapLockStaleMs: 5 * 60 * 1000,
+    leaseWaitMs: 30_000,
+    leasePollMs: 25,
     maxOperationsPerPass: 25,
     maxScanEntries: 20_000,
     now: Date.now,
     isPidAlive: defaultIsPidAlive,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     ...overrides,
   };
 }
@@ -77,6 +125,84 @@ export function resolveCodexHomeLifecycleOptions(
 /** Deleting the plugin clone at run end is on by default; set to keep it between runs. */
 export function shouldDropPluginCloneAfterRun(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PAPERCLIP_CODEX_KEEP_PLUGIN_CACHE !== "1" && env.PAPERCLIP_CODEX_KEEP_PLUGIN_CACHE !== "true";
+}
+
+
+const errCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code;
+const exists = (target: string) => fs.lstat(target).then(() => true, () => false);
+
+// ---------------------------------------------------------------------------
+// Reap lock (outside the home, see the protocol in the header comment)
+// ---------------------------------------------------------------------------
+
+interface ReapLockRecord { pid: number; startedAt: number; token: string }
+
+export function reapLockPath(home: string): string {
+  return `${home}${REAP_LOCK_SUFFIX}`;
+}
+
+/** "free" | "held" (a live reaper is inside its critical section). Abandoned locks are cleared. */
+async function reapLockState(home: string, options: CodexHomeLifecycleOptions): Promise<"free" | "held"> {
+  const file = reapLockPath(home);
+  let stat;
+  try {
+    stat = await fs.lstat(file);
+  } catch (error) {
+    return errCode(error) === "ENOENT" ? "free" : "held"; // cannot tell: fail closed
+  }
+  let record: Partial<ReapLockRecord> | null = null;
+  try {
+    record = JSON.parse(await fs.readFile(file, "utf8")) as Partial<ReapLockRecord>;
+  } catch { /* being written, or corrupt */ }
+  const startedAt = typeof record?.startedAt === "number" ? record.startedAt : stat.mtimeMs;
+  const ownerGone = typeof record?.pid === "number" && !options.isPidAlive(record.pid);
+  const abandoned = ownerGone || options.now() - startedAt > options.reapLockStaleMs;
+  if (!abandoned) return "held";
+  await fs.rm(file, { force: true }).catch(() => undefined);
+  return (await exists(file)) ? "held" : "free";
+}
+
+async function waitForNoReapLock(home: string, options: CodexHomeLifecycleOptions): Promise<boolean> {
+  const polls = Math.max(1, Math.ceil(options.leaseWaitMs / Math.max(1, options.leasePollMs)));
+  for (let i = 0; i < polls; i += 1) {
+    if ((await reapLockState(home, options)) === "free") return true;
+    await options.sleep(options.leasePollMs);
+  }
+  return (await reapLockState(home, options)) === "free";
+}
+
+interface ReapLock { stillHeld(): Promise<boolean>; release(): Promise<void> }
+
+async function takeReapLock(home: string, options: CodexHomeLifecycleOptions): Promise<ReapLock | null> {
+  const file = reapLockPath(home);
+  const token = randomBytes(8).toString("hex");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await fs.open(file, "wx");
+      try {
+        const record: ReapLockRecord = { pid: process.pid, startedAt: options.now(), token };
+        await handle.writeFile(JSON.stringify(record));
+      } finally {
+        await handle.close();
+      }
+      return {
+        stillHeld: async () => {
+          try {
+            return (JSON.parse(await fs.readFile(file, "utf8")) as Partial<ReapLockRecord>).token === token;
+          } catch { return false; }
+        },
+        release: async () => {
+          try {
+            if ((JSON.parse(await fs.readFile(file, "utf8")) as Partial<ReapLockRecord>).token === token) await fs.rm(file, { force: true });
+          } catch { /* already gone or taken over */ }
+        },
+      };
+    } catch (error) {
+      if (errCode(error) !== "EEXIST") throw error; // not contention (e.g. EACCES): report it, do not hide it
+      if ((await reapLockState(home, options)) === "held") return null;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,93 +222,177 @@ export async function touchCodexHomeLastUsed(home: string, now: () => number = D
 }
 
 /**
- * Registers a run in the home. Returns null when the lease could not be written;
- * callers then skip every destructive step for this home (fail closed).
+ * Registers a run in the home and returns the lease, or null when it cannot be
+ * established safely (lock wait timed out, lease unwritable). A run MUST NOT use
+ * the home without a lease: reapers only honour leases.
  */
 export async function acquireCodexHomeLease(
   home: string,
   runId: string,
-  options: Pick<CodexHomeLifecycleOptions, "now" | "maxLeaseMs" | "isPidAlive"> = resolveCodexHomeLifecycleOptions(),
+  partial: Partial<CodexHomeLifecycleOptions> = {},
 ): Promise<CodexHomeLease | null> {
+  const options = resolveCodexHomeLifecycleOptions(process.env, partial);
   const dir = path.join(home, LEASE_DIR_NAME);
   const name = `${runId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80) || "run"}-${randomBytes(4).toString("hex")}.json`;
   const file = path.join(dir, name);
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    const record: LeaseRecord = { pid: process.pid, runId, startedAt: options.now() };
-    await fs.writeFile(file, JSON.stringify(record));
-    await touchCodexHomeLastUsed(home, options.now);
-  } catch {
-    await fs.rm(file, { force: true }).catch(() => undefined);
-    return null;
-  }
-  return {
-    home,
-    release: async () => {
+  const partialFile = `${file}.partial`;
+  // Each lost round means a reaper held the lock at that instant; its critical section is
+  // milliseconds long, so a run only gives up after many rounds (or the wait budget).
+  for (let attempt = 0; attempt < MAX_LEASE_ATTEMPTS; attempt += 1) {
+    if (!(await waitForNoReapLock(home, options))) return null;
+    await options.onStage?.("before-lease-write", home);
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      const record: LeaseRecord = { pid: process.pid, runId, startedAt: options.now() };
+      // Written under a name the lease scan ignores, then renamed: a lease is never half-visible.
+      await fs.writeFile(partialFile, JSON.stringify(record));
+      await fs.rename(partialFile, file);
+    } catch (error) {
+      await fs.rm(partialFile, { force: true }).catch(() => undefined);
       await fs.rm(file, { force: true }).catch(() => undefined);
-      await touchCodexHomeLastUsed(home, options.now);
-      return (await inspectCodexHomeLeases(home, options)) === "idle";
-    },
-  };
+      if (errCode(error) === "ENOENT") continue; // the home was renamed away underneath us: start over on a fresh one
+      return null;
+    }
+    await options.onStage?.("after-lease-write", home);
+    // A reaper that took the lock before our lease existed may already have judged the
+    // home idle. It cannot be allowed to delete a home we are about to use.
+    if ((await reapLockState(home, options)) === "held") {
+      await fs.rm(file, { force: true }).catch(() => undefined);
+      continue;
+    }
+    // The home may have been removed between the write and the lock check.
+    if (!(await exists(file))) continue;
+    await touchCodexHomeLastUsed(home, options.now);
+    return {
+      home,
+      release: async () => {
+        // Record the use first: a reaper that sees no lease must see a fresh last-used stamp.
+        await touchCodexHomeLastUsed(home, options.now);
+        await fs.rm(file, { force: true }).catch(() => undefined);
+        await options.onStage?.("lease-dropped", home);
+        return (await inspectCodexHomeLeases(home, options)) === "idle";
+      },
+    };
+  }
+  return null;
 }
 
 /**
  * "idle": provably no live run. "busy": a live lease exists. "unknown": the lease
  * state could not be read; destructive callers must treat it like "busy".
+ * A lease is live while its process is alive, however long it has been running.
  */
 export async function inspectCodexHomeLeases(
   home: string,
-  options: Pick<CodexHomeLifecycleOptions, "now" | "maxLeaseMs" | "isPidAlive"> = resolveCodexHomeLifecycleOptions(),
+  partial: Partial<CodexHomeLifecycleOptions> = {},
 ): Promise<"idle" | "busy" | "unknown"> {
+  const options = resolveCodexHomeLifecycleOptions(process.env, partial);
   const dir = path.join(home, LEASE_DIR_NAME);
   let names: string[];
   try {
     names = await fs.readdir(dir);
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "idle" : "unknown";
+    return errCode(error) === "ENOENT" ? "idle" : "unknown";
   }
   let state: "idle" | "busy" | "unknown" = "idle";
   for (const name of names) {
+    if (!name.endsWith(".json")) continue; // `.partial` files are not leases yet
     const file = path.join(dir, name);
     let stat;
     try {
       stat = await fs.lstat(file);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if (errCode(error) === "ENOENT") continue;
       state = "unknown";
       continue;
     }
-    const age = options.now() - stat.mtimeMs;
     let record: LeaseRecord | null = null;
     try {
       const parsed = JSON.parse(await fs.readFile(file, "utf8")) as Partial<LeaseRecord>;
-      if (typeof parsed.pid === "number" && typeof parsed.startedAt === "number") record = parsed as LeaseRecord;
-    } catch { /* corrupt or being written */ }
+      if (typeof parsed.pid === "number") record = parsed as LeaseRecord;
+    } catch { /* corrupt */ }
     const live = record
-      ? options.isPidAlive(record.pid) && options.now() - record.startedAt <= options.maxLeaseMs
-      : age <= options.maxLeaseMs; // unreadable lease: protect it until the backstop age
+      ? options.isPidAlive(record.pid)
+      : options.now() - stat.mtimeMs <= options.unreadableLeaseGraceMs;
     if (live) return "busy";
-    // Left by a crashed/killed process (or past the backstop): reclaim the file.
+    // Left by a crashed/killed process: reclaim the file.
     await fs.rm(file, { force: true }).catch(() => { state = "unknown"; });
   }
   return state;
 }
 
+// ---------------------------------------------------------------------------
+// Reaping: one critical section for both `.tmp` and whole-home removal
+// ---------------------------------------------------------------------------
+
+type ReapAction = "none" | "temp" | "home";
+type ReapOutcome = "locked-out" | "in-use" | "none" | "temp" | "home";
+
+/**
+ * Under the home's reap lock: re-inspect leases, let `decide` re-judge idleness
+ * (so nothing stale from before the lock is trusted), then move the victim out of
+ * the way with one rename. Returns what to delete once the lock is dropped.
+ */
+async function reapUnderLock(
+  home: string,
+  options: CodexHomeLifecycleOptions,
+  decide: () => Promise<ReapAction>,
+): Promise<{ outcome: ReapOutcome; garbage: string | null }> {
+  await options.onStage?.("reap-requested", home);
+  const lock = await takeReapLock(home, options);
+  if (!lock) return { outcome: "locked-out", garbage: null };
+  let garbage: string | null = null;
+  let outcome: ReapOutcome = "none";
+  try {
+    if ((await inspectCodexHomeLeases(home, options)) !== "idle") return { outcome: "in-use", garbage: null };
+    const action = await decide();
+    if (action === "none") return { outcome: "none", garbage: null };
+    await options.onStage?.("reap-selected", home);
+    if (!(await lock.stillHeld())) return { outcome: "locked-out", garbage: null };
+    const suffix = randomBytes(4).toString("hex");
+    if (action === "home") {
+      garbage = `${home}.reaping-${suffix}`;
+      await fs.rename(home, garbage);
+    } else {
+      const target = path.join(home, TEMP_DIR);
+      if (await exists(target)) {
+        garbage = path.join(home, `${TEMP_DIR}.reaping-${suffix}`);
+        await fs.rename(target, garbage);
+      }
+    }
+    outcome = action;
+  } catch (error) {
+    garbage = null;
+    if (errCode(error) !== "ENOENT") throw error;
+    outcome = "none"; // already moved or removed by someone else
+  } finally {
+    await lock.release();
+  }
+  if (garbage) await options.onStage?.("reap-renamed", home);
+  return { outcome, garbage };
+}
+
+async function listTempLeftovers(home: string): Promise<string[]> {
+  const names = await fs.readdir(home).catch(() => [] as string[]);
+  return names.filter((name) => TEMP_REAPING.test(name)).map((name) => path.join(home, name));
+}
+
 /**
  * Removes the Codex plugin marketplace clone (`.tmp`) from a home no run is using.
  * Codex re-creates it on demand; sessions, sqlite state and config are untouched.
+ * The check and the removal are one critical section against run leases.
  */
 export async function removeIdleCodexHomeTemp(
   home: string,
-  options: Pick<CodexHomeLifecycleOptions, "now" | "maxLeaseMs" | "isPidAlive"> = resolveCodexHomeLifecycleOptions(),
+  partial: Partial<CodexHomeLifecycleOptions> = {},
 ): Promise<boolean> {
-  if ((await inspectCodexHomeLeases(home, options)) !== "idle") return false;
-  const target = path.join(home, ".tmp");
-  const stat = await fs.lstat(target).catch(() => null);
-  if (!stat) return false;
+  const options = resolveCodexHomeLifecycleOptions(process.env, partial);
+  const { outcome, garbage } = await reapUnderLock(home, options, async () =>
+    (await exists(path.join(home, TEMP_DIR))) ? "temp" : "none");
   // rm never follows a symlink: a `.tmp` link is removed as a link, not its target.
-  await fs.rm(target, { recursive: true, force: true });
-  return true;
+  if (garbage) await fs.rm(garbage, { recursive: true, force: true });
+  for (const leftover of await listTempLeftovers(home)) await fs.rm(leftover, { recursive: true, force: true });
+  return outcome === "temp";
 }
 
 // ---------------------------------------------------------------------------
@@ -216,12 +426,12 @@ async function newestActivityMs(home: string, stopAtOrAbove: number, maxEntries:
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if (errCode(error) === "ENOENT") continue;
       return Infinity;
     }
     for (const entry of entries) {
       // Disposable cache and our own bookkeeping say nothing about session use.
-      if (dir === home && (entry.name === ".tmp" || entry.name === LEASE_DIR_NAME || entry.name === LAST_USED_FILE)) continue;
+      if (dir === home && (entry.name === TEMP_DIR || TEMP_REAPING.test(entry.name) || entry.name === LEASE_DIR_NAME || entry.name === LAST_USED_FILE)) continue;
       if (inspected >= maxEntries) return Infinity;
       const full = path.join(dir, entry.name);
       if (await consider(full)) return newest;
@@ -257,7 +467,6 @@ export async function pruneSupersededCodexHomes(
   const companyRoot = await fs.realpath(input.companyHomeRoot).catch(() => null);
   if (!companyRoot) return report;
   let budget = options.maxOperationsPerPass;
-  const now = options.now();
 
   for (const kind of GENERATED_HOME_KINDS) {
     const kindRoot = await within(companyRoot, path.join(companyRoot, kind));
@@ -275,7 +484,8 @@ export async function pruneSupersededCodexHomes(
       if (budget <= 0) { report.truncated = true; break; }
       const full = path.join(agentRoot, name);
       if (REAPING_DIR.test(name)) {
-        // A previous pass died between rename and delete. Same bounded, contained removal.
+        // Garbage by construction: it only exists after a reaper renamed an idle home
+        // away under the reap lock. A pass that died before deleting it leaves it here.
         budget -= 1;
         await fs.rm(full, { recursive: true, force: true }).then(
           () => report.homesRemoved.push(name),
@@ -291,36 +501,38 @@ export async function pruneSupersededCodexHomes(
       if ((await within(agentRoot, full)) === null) continue;
       report.scanned += 1;
 
-      const lease = await inspectCodexHomeLeases(full, options);
-      if (lease !== "idle") { report.skippedInUse += 1; continue; }
-      const newest = await newestActivityMs(full, now - options.tempGraceMs, options.maxScanEntries);
-      if (newest >= now - options.tempGraceMs) continue; // recently active, or too large to prove idle
+      // Idleness is judged again inside the reap lock; this unlocked pass only avoids
+      // taking the lock for homes that are plainly in use.
+      const decide = async (): Promise<ReapAction> => {
+        const now = options.now();
+        const newest = await newestActivityMs(full, now - options.tempGraceMs, options.maxScanEntries);
+        if (newest >= now - options.tempGraceMs) return "none"; // recently active, or too large to prove idle
+        if (now - newest >= options.retentionMs) return "home";
+        return (await exists(path.join(full, TEMP_DIR))) || (await listTempLeftovers(full)).length > 0 ? "temp" : "none";
+      };
+      if ((await inspectCodexHomeLeases(full, options)) !== "idle") { report.skippedInUse += 1; continue; }
+      if ((await decide()) === "none") continue;
 
       try {
-        if (now - newest >= options.retentionMs) {
-          budget -= 1;
-          const moved = `${full}.reaping-${randomBytes(4).toString("hex")}`;
-          await fs.rename(full, moved);
-          await options.afterRename?.(moved);
-          // A run may have leased the home between the check and the rename.
-          if ((await inspectCodexHomeLeases(moved, options)) !== "idle") {
-            await fs.rename(moved, full).catch((error) => fail(moved, "restore", error));
-            report.skippedInUse += 1;
+        budget -= 1;
+        const { outcome, garbage } = await reapUnderLock(full, options, decide);
+        if (outcome === "in-use" || outcome === "locked-out") { report.skippedInUse += 1; continue; }
+        if (garbage) {
+          try {
+            await fs.rm(garbage, { recursive: true, force: true });
+          } catch (error) {
+            fail(garbage, outcome === "home" ? "remove-home" : "remove-temp", error); // retried by a later pass
             continue;
           }
-          try {
-            await fs.rm(moved, { recursive: true, force: true });
-            report.homesRemoved.push(name);
-          } catch (error) {
-            fail(moved, "remove-home", error); // the *.reaping-* leftover is retried next pass
-          }
-        } else if (stat && (await fs.lstat(path.join(full, ".tmp")).catch(() => null))) {
-          budget -= 1;
-          if (await removeIdleCodexHomeTemp(full, options)) report.tempRemoved.push(name);
+        }
+        if (outcome === "home") report.homesRemoved.push(name);
+        else if (outcome === "temp") {
+          for (const leftover of await listTempLeftovers(full)) await fs.rm(leftover, { recursive: true, force: true });
+          report.tempRemoved.push(name);
         }
       } catch (error) {
         // Another pass already moved or removed it: nothing left to do, not a failure.
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") fail(full, "prune", error);
+        if (errCode(error) !== "ENOENT") fail(full, "prune", error);
       }
     }
     if (budget <= 0) report.truncated = true;

@@ -102,7 +102,6 @@ import {
   pruneSupersededCodexHomes,
   removeIdleCodexHomeTemp,
   shouldDropPluginCloneAfterRun,
-  touchCodexHomeLastUsed,
   type GeneratedHomeKind,
 } from "./codex-home-lifecycle.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
@@ -757,6 +756,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       apiKey: configuredOpenAiApiKey,
     });
   }
+  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
+  const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
+  // A live lease is the only "in use" signal recycling honours (never directory mtimes),
+  // so it is taken BEFORE anything is written into a generated home (seed, config,
+  // sessions). Without a lease a concurrent pass could delete the home under this run,
+  // so the run is refused rather than allowed to proceed unprotected (RAI-2819).
+  let homeLease: Awaited<ReturnType<typeof acquireCodexHomeLease>> = null;
+  if (generatedHome) {
+    homeLease = await acquireCodexHomeLease(effectiveCodexHome, runId);
+    if (!homeLease) {
+      const message = `Codex home "${effectiveCodexHome}" could not be leased for this run; refusing to use a home that recycling cannot see as in use.`;
+      await onLog("stderr", `[paperclip] ${message}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: message,
+        errorCode: "codex_home_lease_unavailable",
+      };
+    }
+  }
+  // Everything from here to the main `try` can throw; the lease must not outlive it.
+  const envConfigStrings = Object.fromEntries(
+    Object.entries(envConfig).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  let preparedRuntimeConfig: Awaited<ReturnType<typeof prepareCodexRuntimeConfig>>;
+  try {
   if (configuredHomeIsManaged && configuredCodexHome) {
     const seedEnv = runtimeSkillDigest ? {
       ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
@@ -765,12 +793,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       apiKey: configuredOpenAiApiKey,
     });
   }
-  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
-  const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
-  // Mark the generated home as used before anything slow runs, so a concurrent
-  // recycling pass never sees a reused old home as idle.
-  if (generatedHome) await touchCodexHomeLastUsed(effectiveCodexHome);
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
   // and with OPENAI_API_KEY="" the provider rejects every request with
@@ -797,22 +820,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // target, so both local and sandboxed Codex processes pick up the routing.
   // A caller-owned home stays untouched. A generated skill home receives the
   // configured provider routing even when it seeds credentials from that home.
-  const envConfigStrings = Object.fromEntries(
-    Object.entries(envConfig).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
-  const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
+  preparedRuntimeConfig = await prepareCodexRuntimeConfig({
     env: envConfigStrings,
     codexHome: configuredCodexHome && !runtimeSkillDigest ? null : effectiveCodexHome,
   });
+  } catch (error) {
+    await homeLease?.release().catch(() => undefined);
+    throw error;
+  }
   // Curated allowlist dir staged for the remote `home` asset (see below). Held
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
-  // A live lease is the only "in use" signal recycling honours (never directory mtimes).
-  // Without one the run still proceeds, but nothing destructive is done to its home.
-  const homeLease = generatedHome ? await acquireCodexHomeLease(effectiveCodexHome, runId) : null;
   let observabilityProfile: Awaited<ReturnType<typeof prepareCodexObservabilityProfile>> | null = null;
   let observabilityPreparationFailed = false;
   try {

@@ -122,21 +122,6 @@ describe("generated Codex home lifecycle", () => {
     expect(after.homesRemoved).toEqual([digest(1)]);
   });
 
-  it("keeps a lease from a live process, a corrupt lease, and only trusts them until the backstop age", async () => {
-    const home = await makeHome(1, 30 * DAY);
-    const dir = path.join(home, LEASE_DIR_NAME);
-    await fs.mkdir(dir);
-    const o = { ...resolveCodexHomeLifecycleOptions(), ...opts() };
-    await fs.writeFile(path.join(dir, "corrupt.json"), "{not json");
-    expect(await inspectCodexHomeLeases(home, o)).toBe("busy");
-    clock += 3 * DAY; // past maxLeaseMs (2d): a never-released lease must not pin a home forever
-    expect(await inspectCodexHomeLeases(home, o)).toBe("idle");
-    await fs.writeFile(path.join(dir, "old-live.json"), JSON.stringify({ pid: process.pid, runId: "r", startedAt: clock - 3 * DAY }));
-    expect(await inspectCodexHomeLeases(home, o)).toBe("idle");
-    await fs.writeFile(path.join(dir, "live.json"), JSON.stringify({ pid: process.pid, runId: "r", startedAt: clock - HOUR }));
-    expect(await inspectCodexHomeLeases(home, o)).toBe("busy");
-  });
-
   it("only the last lease holder may drop the plugin clone; concurrent holders keep it", async () => {
     const home = await makeHome(1, 0);
     const o = { ...resolveCodexHomeLifecycleOptions(), ...opts() };
@@ -150,24 +135,12 @@ describe("generated Codex home lifecycle", () => {
     expect(await exists(path.join(home, "sessions/2026/11/10/rollout.jsonl"))).toBe(true);
   });
 
-  it("restores a home that a run leased between the idle check and the delete", async () => {
-    const home = await makeHome(1, 30 * DAY);
-    const report = await prune(99, {
-      afterRename: async (renamed) => {
-        const lease = path.join(renamed, LEASE_DIR_NAME);
-        await fs.mkdir(lease, { recursive: true });
-        await fs.writeFile(path.join(lease, "late.json"), JSON.stringify({ pid: process.pid, runId: "late", startedAt: clock }));
-      },
-    });
-    expect(report.homesRemoved).toEqual([]);
-    expect(report.skippedInUse).toBe(1);
-    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
-  });
-
   it("is safe when passes overlap: no throw, each home removed once, no spurious failures", async () => {
     for (let n = 1; n <= 6; n += 1) await makeHome(n, 30 * DAY);
     const reports = await Promise.all([prune(99), prune(99), prune(99)]);
-    expect(reports.flatMap((r) => r.homesRemoved).sort()).toEqual([1, 2, 3, 4, 5, 6].map(digest));
+    // A pass may list a home another pass already renamed away; it then deletes that garbage too.
+    const removed = new Set(reports.flatMap((r) => r.homesRemoved).map((name) => name.split(".")[0]));
+    expect([...removed].sort()).toEqual([1, 2, 3, 4, 5, 6].map(digest));
     expect(reports.flatMap((r) => r.failures)).toEqual([]);
     expect(await fs.readdir(agentRoot)).toEqual([]);
   });
@@ -243,4 +216,290 @@ describe("generated Codex home lifecycle", () => {
     expect(await exists(path.join(agentRoot, "notes"))).toBe(true);
     expect(await exists(path.join(agentRoot, digest(10).toUpperCase()))).toBe(true);
   });
+
+  // -------------------------------------------------------------------------
+  // RAI-2819: lease / delete interleavings. Each test pins one ordering with the
+  // protocol's stage hooks and an injected sleep, so nothing depends on timing.
+  // -------------------------------------------------------------------------
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const leaseFiles = async (home: string) =>
+    (await fs.readdir(path.join(home, LEASE_DIR_NAME)).catch(() => [] as string[])).filter((n) => n.endsWith(".json"));
+  const lifecycle = (extra: Parameters<typeof acquireCodexHomeLease>[2] = {}) => ({ ...opts(), leasePollMs: 1, ...extra });
+
+  it("a lease taken after the reaper judged `.tmp` idle makes the run wait, then use a home nothing deletes", async () => {
+    const home = await makeHome(1, 2 * HOUR);
+    const waiting = deferred();
+    const reaperDone = deferred();
+    let acquired: Awaited<ReturnType<typeof acquireCodexHomeLease>> | undefined;
+    let settled = false;
+    const pending: { p?: Promise<unknown> } = {};
+    const report = await prune(99, {
+      onStage: async (stage) => {
+        if (stage !== "reap-selected") return;
+        // The reaper holds the lock and has already seen "no lease": a run arrives now.
+        pending.p = acquireCodexHomeLease(home, "late-run", lifecycle({
+          sleep: async () => { waiting.resolve(); await reaperDone.promise; },
+        })).then((lease) => { acquired = lease; settled = true; });
+        await waiting.promise;
+        expect(settled).toBe(false); // it must not proceed while the reaper may still delete
+      },
+    });
+    reaperDone.resolve();
+    await pending.p;
+    expect(report.tempRemoved).toEqual([digest(1)]);
+    expect(acquired).not.toBeNull();
+    expect(await leaseFiles(home)).toHaveLength(1);
+    // The run now owns the home: Codex re-creates the clone and no later pass may take it.
+    await fs.mkdir(path.join(home, ".tmp/plugins"), { recursive: true });
+    expect(await removeIdleCodexHomeTemp(home, opts())).toBe(false);
+    expect((await prune(99)).tempRemoved).toEqual([]);
+    expect(await exists(path.join(home, ".tmp/plugins"))).toBe(true);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it("the same interleaving on an expired home: the run gets a fresh home, never a half-deleted one", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const waiting = deferred();
+    const reaperDone = deferred();
+    let acquired: Awaited<ReturnType<typeof acquireCodexHomeLease>> | undefined;
+    const pending: { p?: Promise<unknown> } = {};
+    const report = await prune(99, {
+      onStage: async (stage) => {
+        if (stage !== "reap-selected") return;
+        // The lease is written into the home right before the reaper renames it away.
+        await fs.mkdir(path.join(home, LEASE_DIR_NAME), { recursive: true });
+        await fs.writeFile(path.join(home, LEASE_DIR_NAME, "racing.json"), JSON.stringify({ pid: process.pid, runId: "racing", startedAt: clock }));
+        pending.p = acquireCodexHomeLease(home, "late-run", lifecycle({
+          sleep: async () => { waiting.resolve(); await reaperDone.promise; },
+        })).then((lease) => { acquired = lease; });
+        await waiting.promise;
+      },
+    });
+    reaperDone.resolve();
+    await pending.p;
+    expect(report.homesRemoved).toEqual([digest(1)]);
+    expect(acquired).not.toBeNull();
+    // Fresh home: the old state is gone, the run's lease is intact, and the stranded
+    // lease that was renamed away with the old home does not pin the new one.
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(false);
+    expect(await leaseFiles(home)).toHaveLength(1);
+    expect(await inspectCodexHomeLeases(home, opts())).toBe("busy");
+    expect((await fs.readdir(agentRoot)).filter((n) => n.includes("reaping"))).toEqual([]);
+    expect((await prune(99)).homesRemoved).toEqual([]);
+  });
+
+  it("a lease written before the reaper takes its lock is seen by the reaper, which leaves the home alone", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    let inner: Awaited<ReturnType<typeof pruneSupersededCodexHomes>> | undefined;
+    let tempRemoved: boolean | undefined;
+    const lease = await acquireCodexHomeLease(home, "early-run", lifecycle({
+      onStage: async (stage) => {
+        if (stage !== "after-lease-write") return;
+        // The run's lease is on disk but it has not re-checked the lock yet.
+        tempRemoved = await removeIdleCodexHomeTemp(home, opts());
+        inner = await prune(99);
+      },
+    }));
+    expect(lease).not.toBeNull();
+    expect(tempRemoved).toBe(false);
+    expect(inner?.homesRemoved).toEqual([]);
+    expect(inner?.skippedInUse).toBe(1);
+    expect(await exists(path.join(home, ".tmp/plugins"))).toBe(true);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it("a reaper that finishes before the run writes its lease costs the run nothing but a fresh home", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    let inner: Awaited<ReturnType<typeof pruneSupersededCodexHomes>> | undefined;
+    const lease = await acquireCodexHomeLease(home, "run", lifecycle({
+      onStage: async (stage) => {
+        if (stage === "before-lease-write" && !inner) inner = await prune(99); // renames the old home away
+      },
+    }));
+    expect(inner?.homesRemoved).toEqual([digest(1)]);
+    expect(lease).not.toBeNull();
+    expect(await leaseFiles(home)).toHaveLength(1);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(false);
+    expect((await prune(99)).homesRemoved).toEqual([]); // the new home is leased
+  });
+
+  it("does not reap a home whose run started and finished after the unlocked idleness check", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const report = await prune(99, {
+      onStage: async (stage, target) => {
+        if (stage !== "reap-requested") return;
+        // Between the unlocked "looks idle" check and the lock, a run uses the home and ends.
+        const lease = await acquireCodexHomeLease(target, "quick-run", lifecycle());
+        await fs.writeFile(path.join(target, "sessions/2026/11/10/rollout.jsonl"), "{\"new\":1}\n");
+        await lease!.release();
+      },
+    });
+    expect(report.homesRemoved).toEqual([]);
+    expect(await fs.readFile(path.join(home, "sessions/2026/11/10/rollout.jsonl"), "utf8")).toBe("{\"new\":1}\n");
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it("a lease written while the reaper sits between its idle check and its rename is withdrawn, never lost", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const selected = deferred();
+    const gate = deferred();
+    let reaper: Promise<unknown> | undefined;
+    let started = false;
+    const lease = await acquireCodexHomeLease(home, "run", lifecycle({
+      onStage: async (stage) => {
+        if (stage !== "before-lease-write" || started) return;
+        started = true;
+        // The run passed its first lock check; now a reaper locks the home, sees no
+        // lease, and pauses right before it renames the home away.
+        reaper = prune(99, { onStage: async (s) => { if (s === "reap-selected") { selected.resolve(); await gate.promise; } } });
+        await selected.promise;
+      },
+      // The run's retry has to wait for the reaper; only then does the reaper finish.
+      sleep: async () => { gate.resolve(); await reaper; },
+    }));
+    gate.resolve();
+    await reaper;
+    expect(lease).not.toBeNull();
+    // The lease must live in the home the run will use, not in garbage the reaper deleted.
+    expect(await leaseFiles(home)).toHaveLength(1);
+    expect(await inspectCodexHomeLeases(home, opts())).toBe("busy");
+    expect((await fs.readdir(agentRoot)).filter((n) => n.includes("reaping"))).toEqual([]);
+  });
+
+  it("a reaper that runs the instant a lease is dropped still sees the run's use of the home", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    let during: Awaited<ReturnType<typeof pruneSupersededCodexHomes>> | undefined;
+    const lease = await acquireCodexHomeLease(home, "run", lifecycle({
+      onStage: async (stage) => {
+        if (stage === "lease-dropped") during = await prune(99); // no lease left, nothing else but last-used
+      },
+    }));
+    await setIdle(home, 30 * DAY); // the run left no session writes; only its stamps say it was used
+    expect(await lease!.release()).toBe(true);
+    expect(during?.homesRemoved).toEqual([]);
+    expect(during?.tempRemoved).toEqual([]);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it("release stamps last-used before dropping the lease, so a just-finished run's home is not reaped", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const lease = await acquireCodexHomeLease(home, "run", lifecycle());
+    await fs.rm(path.join(home, LAST_USED_FILE), { force: true });
+    await setIdle(home, 30 * DAY);
+    expect(await lease!.release()).toBe(true);
+    expect((await prune(99)).homesRemoved).toEqual([]);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it("never reclaims a live run's lease by age: a run alive for 10 days keeps home, sessions and plugins", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const lease = await acquireCodexHomeLease(home, "long-run", lifecycle({ retentionMs: DAY }));
+    expect(lease).not.toBeNull();
+    for (const days of [3, 10, 400]) {
+      clock += days * DAY;
+      expect(await inspectCodexHomeLeases(home, opts())).toBe("busy");
+      expect(await removeIdleCodexHomeTemp(home, opts())).toBe(false);
+      const report = await prune(99, { retentionMs: DAY, tempGraceMs: HOUR });
+      expect(report.homesRemoved).toEqual([]);
+      expect(report.tempRemoved).toEqual([]);
+      expect(report.skippedInUse).toBe(1);
+    }
+    expect(await exists(path.join(home, ".tmp/plugins/marketplace.json"))).toBe(true);
+    expect(await exists(path.join(home, "sessions/2026/11/10/rollout.jsonl"))).toBe(true);
+    expect(await leaseFiles(home)).toHaveLength(1);
+    // Only the death of its process (or its own release) ends the lease.
+    expect(await inspectCodexHomeLeases(home, { ...opts(), isPidAlive: () => false })).toBe("idle");
+  });
+
+  it("an unreadable lease is trusted only for the grace period", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const dir = path.join(home, LEASE_DIR_NAME);
+    await fs.mkdir(dir);
+    await fs.writeFile(path.join(dir, "corrupt.json"), "{not json");
+    await fs.writeFile(path.join(dir, "half-written.json.partial"), "{");
+    const o = { ...resolveCodexHomeLifecycleOptions(), ...opts() };
+    expect(await inspectCodexHomeLeases(home, o)).toBe("busy");
+    clock += 3 * DAY;
+    expect(await inspectCodexHomeLeases(home, o)).toBe("idle");
+    await fs.writeFile(path.join(dir, "live.json"), JSON.stringify({ pid: process.pid, runId: "r", startedAt: clock - HOUR }));
+    expect(await inspectCodexHomeLeases(home, o)).toBe("busy");
+  });
+
+  it("returns no lease, and leaves nothing behind, when the lease cannot be written", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    await fs.writeFile(path.join(home, LEASE_DIR_NAME), "not a directory");
+    expect(await acquireCodexHomeLease(home, "run", lifecycle())).toBeNull();
+    // A home whose lease state cannot be read is treated as in use, never as idle.
+    expect(await inspectCodexHomeLeases(home, opts())).toBe("unknown");
+    const report = await prune(99);
+    expect(report.homesRemoved).toEqual([]);
+    expect(report.skippedInUse).toBe(1);
+    expect(await removeIdleCodexHomeTemp(home, opts())).toBe(false);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+    expect(await exists(path.join(home, ".tmp/plugins"))).toBe(true);
+  });
+
+  it("gives up (fail closed) when a live reaper never releases its lock, and clears a dead reaper's lock", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const lock = path.join(agentRoot, `${digest(1)}.reap-lock`);
+    await fs.writeFile(lock, JSON.stringify({ pid: process.pid, startedAt: clock, token: "t" }));
+    expect(await acquireCodexHomeLease(home, "run", lifecycle({ leaseWaitMs: 5, sleep: async () => undefined }))).toBeNull();
+    expect(await leaseFiles(home)).toEqual([]);
+    // The reaper died holding the lock: the next run clears it and proceeds.
+    await fs.writeFile(lock, JSON.stringify({ pid: process.pid, startedAt: clock, token: "t" }));
+    const lease = await acquireCodexHomeLease(home, "run", lifecycle({ isPidAlive: () => false }));
+    expect(lease).not.toBeNull();
+    expect(await exists(lock)).toBe(false);
+    // A lock that has outlived its stale age is cleared even if its pid is alive (e.g. reused).
+    const second = await acquireCodexHomeLease(home, "run-2", lifecycle());
+    await fs.writeFile(lock, JSON.stringify({ pid: process.pid, startedAt: clock - HOUR, token: "t" }));
+    expect(await acquireCodexHomeLease(home, "run-3", lifecycle())).not.toBeNull();
+    expect(second).not.toBeNull();
+  });
+
+  it("sweeps a `.tmp.reaping-*` leftover and never counts it as session activity", async () => {
+    const home = await makeHome(1, 2 * HOUR);
+    await fs.rename(path.join(home, ".tmp"), path.join(home, ".tmp.reaping-deadbeef"));
+    const report = await prune(99);
+    expect(report.tempRemoved).toEqual([digest(1)]);
+    expect(await exists(path.join(home, ".tmp.reaping-deadbeef"))).toBe(false);
+    expect(await exists(path.join(home, "state_5.sqlite"))).toBe(true);
+  });
+
+  it("invariant under real concurrency: a run that holds a lease never loses its marker", async () => {
+    const home = await makeHome(1, 30 * DAY);
+    const violations: string[] = [];
+    let stop = false;
+    const reaper = (async () => {
+      while (!stop) {
+        await prune(99);
+        await removeIdleCodexHomeTemp(home, opts());
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    const runner = async (id: number) => {
+      for (let i = 0; i < 25; i += 1) {
+        // Backdate before every run so each iteration is a fresh chance to be reaped.
+        const lease = await acquireCodexHomeLease(home, `run-${id}-${i}`, lifecycle({ leaseWaitMs: 10_000 }));
+        if (!lease) { violations.push(`run-${id}-${i}: no lease`); continue; }
+        const marker = path.join(home, `marker-${id}-${i}`);
+        await fs.writeFile(marker, "x");
+        await fs.mkdir(path.join(home, ".tmp/plugins"), { recursive: true });
+        await new Promise((resolve) => setImmediate(resolve));
+        if (!(await exists(marker))) violations.push(`run-${id}-${i}: home deleted under a live lease`);
+        if (!(await exists(path.join(home, ".tmp/plugins")))) violations.push(`run-${id}-${i}: plugins deleted under a live lease`);
+        await lease.release();
+        await fs.rm(marker, { force: true });
+        await setIdle(home, 30 * DAY).catch(() => undefined);
+      }
+    };
+    await Promise.all([runner(1), runner(2), runner(3)]);
+    stop = true;
+    await reaper;
+    expect(violations).toEqual([]);
+  }, 60_000);
 });

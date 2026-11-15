@@ -1866,6 +1866,117 @@ process.exit(1);
     }
   });
 
+  // RAI-2819: a run that cannot be leased must not use a shared generated home, because
+  // recycling only honours leases and would see the home as idle.
+  it("refuses to run in a generated home it cannot lease, and leaves the home untouched", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-lease-fail-codex-"));
+    const workspace = path.join(root, "workspace");
+    const command = path.join(root, "codex");
+    const capture = path.join(root, "capture.json");
+    const skillSource = path.join(root, "skill-v1");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(skillSource, { recursive: true });
+    await fs.writeFile(path.join(skillSource, "SKILL.md"), "# AgentMail\nAssigned inbox one.");
+    await writeFakeCodexCommand(command);
+    const keys = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "CODEX_HOME"] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip");
+    process.env.PAPERCLIP_INSTANCE_ID = "lease-fail";
+    delete process.env.CODEX_HOME;
+    const credentialHomes: string[] = [];
+    const invoke = async () => {
+      const parent = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "paperclip-ai-company-1-grant-1-"));
+      credentialHomes.push(parent);
+      const provider = path.join(parent, "provider");
+      await fs.mkdir(provider, { mode: 0o700 });
+      await fs.writeFile(path.join(provider, "config.toml"), 'cli_auth_credentials_store = "file"\n');
+      await fs.writeFile(path.join(provider, "auth.json"), JSON.stringify({ tokens: { account_id: "acct-a", access_token: "t" } }));
+      const config = {
+        engine: "cli", command, cwd: workspace,
+        env: { CODEX_HOME: provider, PAPERCLIP_TEST_CAPTURE_PATH: capture },
+        managedAiConnection: { sessionIdentity: "grant-1:user-1:secret-1:1" },
+        paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/agentmail"] },
+        paperclipRuntimeSkills: [{ key: "paperclipai/paperclip/agentmail", runtimeName: "agentmail", source: skillSource }],
+      };
+      return execute({ runId: `run-${Math.random()}`,
+        agent: { id: "agent-1", companyId: "company-1", name: "QA", adapterType: "codex_local", adapterConfig: config },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config, context: {}, authToken: "test-token", onLog: async () => {},
+      });
+    };
+    try {
+      const ok = await invoke();
+      expect(ok.exitCode).toBe(0);
+      const home = JSON.parse(await fs.readFile(capture, "utf8")).codexHome as string;
+      await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+      await fs.writeFile(path.join(home, "sessions/rollout.jsonl"), "{}\n");
+      // The lease directory can no longer be created in this home.
+      await fs.rm(path.join(home, ".paperclip-leases"), { recursive: true, force: true });
+      await fs.writeFile(path.join(home, ".paperclip-leases"), "blocked");
+      await fs.rm(capture, { force: true });
+
+      const refused = await invoke();
+      expect(refused.errorCode).toBe("codex_home_lease_unavailable");
+      expect(refused.exitCode).toBeNull();
+      await expect(fs.stat(capture)).rejects.toMatchObject({ code: "ENOENT" }); // codex was never launched
+      expect(await fs.readFile(path.join(home, "sessions/rollout.jsonl"), "utf8")).toBe("{}\n");
+    } finally {
+      for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }
+      await Promise.all(credentialHomes.map((dir) => fs.rm(dir, { recursive: true, force: true })));
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // RAI-2819: setup between lease acquisition and the main try (credential check, runtime
+  // config) can throw; the lease must not outlive that, or the home is pinned until the
+  // server process exits.
+  it("releases the home lease when setup throws before the run starts", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-lease-setup-fail-codex-"));
+    const workspace = path.join(root, "workspace");
+    const command = path.join(root, "codex");
+    const skillSource = path.join(root, "skill-v1");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(skillSource, { recursive: true });
+    await fs.writeFile(path.join(skillSource, "SKILL.md"), "# AgentMail\nAssigned inbox one.");
+    await writeFakeCodexCommand(command);
+    const keys = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "CODEX_HOME", "OPENAI_API_KEY"] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip");
+    process.env.PAPERCLIP_INSTANCE_ID = "lease-setup-fail";
+    delete process.env.CODEX_HOME;
+    delete process.env.OPENAI_API_KEY;
+    const parent = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "paperclip-ai-company-1-grant-1-"));
+    const provider = path.join(parent, "provider");
+    await fs.mkdir(provider, { mode: 0o700 });
+    // No auth.json: assertCodexCredentialsLaunchable throws after the lease is taken.
+    await fs.writeFile(path.join(provider, "config.toml"), 'cli_auth_credentials_store = "file"\n');
+    const config = {
+      engine: "cli", command, cwd: workspace,
+      env: { CODEX_HOME: provider },
+      managedAiConnection: { sessionIdentity: "grant-1:user-1:secret-1:1" },
+      paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/agentmail"] },
+      paperclipRuntimeSkills: [{ key: "paperclipai/paperclip/agentmail", runtimeName: "agentmail", source: skillSource }],
+    };
+    try {
+      await expect(execute({ runId: "run-setup-fail",
+        agent: { id: "agent-1", companyId: "company-1", name: "QA", adapterType: "codex_local", adapterConfig: config },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config, context: {}, authToken: "test-token", onLog: async () => {},
+      })).rejects.toThrow(/no Codex credentials provisioned/);
+      const agentRoot = path.join(process.env.PAPERCLIP_HOME, "instances/lease-setup-fail/companies/company-1/codex-home/skill-runtimes/agent-1");
+      const homes = (await fs.readdir(agentRoot)).filter((name) => /^[a-f0-9]{64}$/.test(name));
+      // The home was created (so the lease really was taken), and holds no lease now.
+      expect(homes).toHaveLength(1);
+      const leases = (await fs.readdir(path.join(agentRoot, homes[0], ".paperclip-leases")).catch(() => []))
+        .filter((name) => name.endsWith(".json"));
+      expect(leases).toEqual([]);
+    } finally {
+      for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }
+      await fs.rm(parent, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("respects an explicit CODEX_HOME config override even in worktree mode", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-explicit-"));
     const workspace = path.join(root, "workspace");
