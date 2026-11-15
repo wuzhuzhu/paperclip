@@ -33,6 +33,10 @@ import path from "node:path";
  * wins the lease never sees a half-deleted home: it starts on the original home
  * or, if a reaper took it first, on a freshly created one. A lease whose process
  * is alive is never reclaimed, however old: there is no age backstop for it.
+ * The same holds for reap locks: elapsed time cannot fence a paused owner that
+ * already passed stillHeld and may resume its rename. Only a valid PID proven
+ * dead permits recovery. Damaged locks and reused live PIDs fail closed; without
+ * process-start identity, PID reuse cannot safely be distinguished from liveness.
  */
 export const GENERATED_HOME_KINDS = ["skill-runtimes", "connector-runtimes"] as const;
 export type GeneratedHomeKind = (typeof GENERATED_HOME_KINDS)[number];
@@ -70,7 +74,7 @@ export interface CodexHomeLifecycleOptions {
    * this long. A parsed lease whose process is alive is NEVER reclaimed by age.
    */
   unreadableLeaseGraceMs: number;
-  /** A reap lock older than this (or whose owner died) is considered abandoned. */
+  /** @deprecated Retained for caller compatibility; lock age never permits takeover. */
   reapLockStaleMs: number;
   /** How long a run waits for a reaper to finish its (millisecond-scale) critical section. */
   leaseWaitMs: number;
@@ -144,9 +148,8 @@ export function reapLockPath(home: string): string {
 /** "free" | "held" (a live reaper is inside its critical section). Abandoned locks are cleared. */
 async function reapLockState(home: string, options: CodexHomeLifecycleOptions): Promise<"free" | "held"> {
   const file = reapLockPath(home);
-  let stat;
   try {
-    stat = await fs.lstat(file);
+    await fs.lstat(file);
   } catch (error) {
     return errCode(error) === "ENOENT" ? "free" : "held"; // cannot tell: fail closed
   }
@@ -154,10 +157,10 @@ async function reapLockState(home: string, options: CodexHomeLifecycleOptions): 
   try {
     record = JSON.parse(await fs.readFile(file, "utf8")) as Partial<ReapLockRecord>;
   } catch { /* being written, or corrupt */ }
-  const startedAt = typeof record?.startedAt === "number" ? record.startedAt : stat.mtimeMs;
-  const ownerGone = typeof record?.pid === "number" && !options.isPidAlive(record.pid);
-  const abandoned = ownerGone || options.now() - startedAt > options.reapLockStaleMs;
-  if (!abandoned) return "held";
+  const pid = record?.pid;
+  // Age is not fencing: a live owner may be suspended inside fs.rename, after
+  // its last ownership check. Invalid/unknown owners must also fail closed.
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || options.isPidAlive(pid)) return "held";
   await fs.rm(file, { force: true }).catch(() => undefined);
   return (await exists(file)) ? "held" : "free";
 }
